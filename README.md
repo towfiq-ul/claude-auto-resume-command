@@ -1,5 +1,16 @@
 # /auto-resume — continue a Claude Code session when your usage limit resets
 
+This repo has two related tools:
+
+- **`/auto-resume`** (below) — you tell it when to resume; it types
+  `continue` back into your session at that time.
+- **[`claude-session-guardian`](#session-guardian--automatic-progress-notes--auto-resume)**
+  — a Stop hook that detects the usage-limit banner itself and calls
+  `claude-auto-resume` automatically, plus leaves a progress note. No
+  manual step needed.
+
+---
+
 When Claude Code hits a usage limit, the session pauses ("resets at 7pm").
 `auto-resume` waits until the time you give it, then feeds your instruction
 (default: `continue`) back to the session — by typing it into the **same
@@ -102,3 +113,100 @@ claude-auto-resume cancel
   `claude --continue` to review and keep going. Extra CLI args can be
   passed via `AUTO_RESUME_CLAUDE_ARGS`.
 - State/log live in `~/.claude/auto-resume/`.
+
+---
+
+## Session Guardian — automatic progress notes + auto-resume
+
+`claude-session-guardian` is a **Stop hook** (fires after every Claude Code
+turn) that watches for the "You've hit your session limit · resets HH:MM"
+banner itself, so you don't have to notice it and run `claude-auto-resume`
+by hand. When it sees one, it:
+
+1. Appends a short progress note to `PROGRESS.md` in the project directory
+   (timestamp, the reset banner, the scheduled resume time, and your last
+   instruction — so picking the thread back up is easy).
+2. Automatically runs `claude-auto-resume` for the stated reset time (+2 min
+   safety buffer).
+
+On every normal turn (the overwhelming majority) it's a fast no-op: it reads
+only the tail of the current transcript and exits immediately if no limit
+was hit — no visible delay, nothing written anywhere.
+
+### How it works
+
+- Claude Code fires the `Stop` hook after each turn and passes it JSON on
+  stdin, ideally including `transcript_path`. `session-guardian.sh` falls
+  back to scanning `~/.claude/projects/<project>/` for the newest `.jsonl`
+  if that field is missing.
+- It hands the last ~40 lines of that transcript to `detect_limit.py`, which
+  checks whether the most recent assistant message is a 429 rate-limit
+  error (or contains "session limit" / "resets"), and if so extracts the
+  stated time and your last message.
+- If a limit was hit, it dedupes against the last-seen banner (so retries
+  while still blocked don't spam `PROGRESS.md` or reschedule repeatedly),
+  appends the progress note, and invokes `claude-auto-resume` in the
+  background.
+- The hook runs `async: true` with a 20s timeout, so it can never stall the
+  UI even briefly.
+
+### What it can't do
+
+Claude Code doesn't expose a hook for an early "95% of your limit" warning
+— only the hard stop is a reliably observable, scriptable signal (the 429
+error / "session limit" banner). This hook acts on that hard stop, which is
+also the only point at which there's a concrete reset time to schedule
+around.
+
+### Install
+
+```bash
+./install-guardian.sh
+```
+
+This symlinks `session-guardian.sh` → `~/.local/bin/claude-session-guardian`
+(resolving its own symlink to find `detect_limit.py` next to it) and merges
+a `Stop` hook into `~/.claude/settings.json` (existing settings and other
+hooks are preserved — nothing is overwritten).
+
+Requires `jq` (to merge settings.json) and `python3` (to run the detector).
+Install `claude-auto-resume` too (`./install.sh`) — without it, the hook
+still writes progress notes but has nothing to call to auto-resume.
+
+Takes effect in **new** Claude Code sessions immediately. In an already
+running session, run `/hooks` once (or restart) to pick it up — Claude Code
+only watches settings directories that existed when the session started.
+
+### Uninstall
+
+```bash
+./uninstall-guardian.sh
+```
+
+Removes the symlink and the `Stop` hook entry from `~/.claude/settings.json`
+(only that entry — other hooks/settings are untouched). Any `PROGRESS.md`
+notes already written are left in place.
+
+### Configuration
+
+Environment variables, set before Claude Code starts (e.g. in your shell
+profile) or per-hook via managed settings:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SESSION_GUARDIAN_PROGRESS_FILE` | `<project dir>/PROGRESS.md` | where the note is appended |
+| `SESSION_GUARDIAN_BUFFER_SECONDS` | `120` | how long past the stated reset time to schedule the resume |
+| `SESSION_GUARDIAN_STATE_DIR` | `~/.claude/auto-resume` | where the dedup marker is kept |
+| `SESSION_GUARDIAN_DISABLE` | unset | set to `1` to no-op the hook without uninstalling |
+
+### Notes & limitations
+
+- Depends on `claude-auto-resume`'s own limitations for the actual resume
+  (needs tmux or X11/xdotool for terminal injection; falls back to
+  headless `claude --continue` otherwise — see above).
+- The progress note's project directory is `$CLAUDE_PROJECT_DIR` if Claude
+  Code sets it, else the hook's working directory at Stop time.
+- Detection is text-pattern-based (429 status + "session limit"/"resets" in
+  the banner). If Claude Code ever changes that wording, the regex in
+  `detect_limit.py` (`resets?\s+(\d{1,2}:\d{2}\s*(?:am|pm)?)`) may need a
+  matching update.
