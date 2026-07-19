@@ -1,6 +1,6 @@
 ---
 description: Schedule an automatic "continue" in this terminal after a delay (e.g. when your usage limit resets)
-argument-hint: <time: 2h30m | 19:45 | 90> [message] | status | cancel
+argument-hint: <time: 2h30m | 19:45 | 90> [message] | status | cancel [<id>|all]
 allowed-tools: Bash(claude-auto-resume:*)
 ---
 

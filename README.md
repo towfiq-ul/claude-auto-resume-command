@@ -93,9 +93,31 @@ Force offline mode (save the instruction, run it headlessly at the time):
 Manage:
 
 ```
-claude-auto-resume status
-claude-auto-resume cancel
+claude-auto-resume status            # lists ALL pending jobs, this terminal's marked
+claude-auto-resume cancel            # cancels this terminal's job (or the only one)
+claude-auto-resume cancel <id>       # cancels a specific job (id shown by status)
+claude-auto-resume cancel all        # cancels every pending job
 ```
+
+### Multiple terminals, tabs, and tmux windows/panes
+
+Each terminal can have its own pending resume at the same time — jobs are
+keyed per terminal (tmux pane / X11 window) + working directory, so
+scheduling in one terminal never touches another terminal's job.
+Re-running `claude-auto-resume` from the same terminal+directory replaces
+only that terminal's job.
+
+- **tmux**: fully supported at any granularity — every pane in every
+  window/session is a distinct target (`$TMUX_PANE`), and `send-keys`
+  reaches it even when it isn't the active pane. This is the most reliable
+  setup for many concurrent sessions.
+- **X11 terminal windows** (xdotool): each *window* is a distinct target.
+- **Tabs inside one X11 terminal window**: X11 sees the whole window, not
+  individual tabs — at fire time the window is activated and the keystrokes
+  land in whichever tab is *currently selected*. If you run several Claude
+  sessions in tabs of the same window, prefer tmux (or separate windows);
+  otherwise make sure the right tab is selected at fire time, or use
+  `--offline`.
 
 ## Notes & limitations
 
@@ -146,7 +168,9 @@ was hit — no visible delay, nothing written anywhere.
 - If a limit was hit, it dedupes against the last-seen banner (so retries
   while still blocked don't spam `PROGRESS.md` or reschedule repeatedly),
   appends the progress note, and invokes `claude-auto-resume` in the
-  background.
+  background. The dedup marker is kept **per session** (keyed by transcript),
+  so several Claude sessions in different terminals/tabs can each hit their
+  limit and each still gets its own note and scheduled resume.
 - The hook runs `async: true` with a 20s timeout, so it can never stall the
   UI even briefly.
 

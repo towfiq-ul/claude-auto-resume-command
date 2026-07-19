@@ -59,7 +59,11 @@ eval "$(tail -n 40 "$transcript_path" | python3 "$script_dir/detect_limit.py")"
 
 state_dir="${SESSION_GUARDIAN_STATE_DIR:-$HOME/.claude/auto-resume}"
 mkdir -p "$state_dir"
-dedup_file="$state_dir/session-guardian-last"
+# Dedup per session (keyed by transcript path), not globally — several
+# terminals/tabs can hit their limits independently and each still gets
+# its own progress note + scheduled resume.
+session_key="$(printf '%s' "$transcript_path" | md5sum | cut -c1-10)"
+dedup_file="$state_dir/session-guardian-last-$session_key"
 
 # Avoid re-acting every retry while still blocked (Stop fires repeatedly).
 last_seen=""

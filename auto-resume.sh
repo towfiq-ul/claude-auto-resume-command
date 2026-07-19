@@ -8,7 +8,7 @@
 # Usage:
 #   claude-auto-resume [--offline] <time> [message]
 #   claude-auto-resume status
-#   claude-auto-resume cancel
+#   claude-auto-resume cancel [<id>|all]
 #
 # <time> forms:
 #   2h30m | 45m | 90s     duration from now
@@ -16,6 +16,12 @@
 #   19:45 | 7:45pm        clock time (rolls to tomorrow if already past)
 #
 # [message] is what gets typed into the terminal (default: "continue").
+#
+# Multiple terminals/tabs/panes can each have their own pending job at the
+# same time: jobs are keyed per terminal (tmux pane / X window) + directory.
+# Scheduling again from the same terminal+directory replaces only that job.
+# `status` lists all jobs; `cancel` with no argument cancels this terminal's
+# job (or the only job), `cancel <id>` a specific one, `cancel all` every one.
 #
 # Backends (chosen at schedule time):
 #   tmux    — if running inside tmux (works without X)
@@ -81,7 +87,10 @@ detect_backend() {
     if [[ "${FORCE_OFFLINE:-}" != "1" ]]; then
         if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null; then
             BACKEND="tmux"
-            TARGET_ID=$(tmux display-message -p '#{pane_id}')
+            # $TMUX_PANE is the pane this shell lives in — correct even when
+            # other panes/windows are focused; display-message without -t
+            # would report the *active* pane instead.
+            TARGET_ID="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}')}"
             return
         elif [[ -n "${DISPLAY:-}" ]] && command -v xdotool >/dev/null; then
             BACKEND="xdotool"
@@ -175,7 +184,7 @@ fire() {
 # ---------- watcher (detached background process) ----------
 
 watch_and_fire() {
-    local target_epoch="$1" backend="$2" target_id="$3" message="$4" workdir="${5:-$HOME}" now remaining
+    local target_epoch="$1" backend="$2" target_id="$3" message="$4" workdir="${5:-$HOME}" job_file="${6:-}" now remaining
     # Wall-clock loop instead of one long sleep, so suspend/resume can't
     # stretch the wait past the intended time.
     while :; do
@@ -185,58 +194,152 @@ watch_and_fire() {
         sleep "$((remaining < 30 ? remaining : 30))"
     done
     fire "$backend" "$target_id" "$message" "$workdir"
-    rm -f "$JOB_FILE"
+    [[ -n "$job_file" ]] && rm -f "$job_file"
 }
 
 # ---------- job management ----------
+# One job file per terminal+directory in $JOBS_DIR, so several terminals,
+# tabs, or tmux panes can each have their own pending resume concurrently.
 
-JOB_FILE="$STATE_DIR/job"
+JOBS_DIR="$STATE_DIR/jobs"
+
+job_key() {
+    printf '%s:%s:%s' "$1" "$2" "$3" | md5sum | cut -c1-10
+}
+
+# A job file from a pre-multi-job version lives at $STATE_DIR/job; adopt it.
+migrate_legacy_job() {
+    [[ -f "$STATE_DIR/job" ]] || return 0
+    mkdir -p "$JOBS_DIR"
+    mv "$STATE_DIR/job" "$JOBS_DIR/legacy.job"
+}
+
+# Keys (one per line) this terminal+directory could have scheduled under:
+# the auto-detected backend and forced-offline mode (a job scheduled with
+# --offline has the offline key even when tmux/xdotool are available).
+# Subshells so detect_backend's `exit` can't kill us.
+current_job_keys() {
+    {
+        (
+            detect_backend >/dev/null 2>&1
+            job_key "$BACKEND" "$TARGET_ID" "$PWD"
+        ) 2>/dev/null || true
+        (
+            FORCE_OFFLINE=1 detect_backend >/dev/null 2>&1
+            job_key "$BACKEND" "$TARGET_ID" "$PWD"
+        ) 2>/dev/null || true
+    } | sort -u
+}
+
+list_jobs() {
+    shopt -s nullglob
+    local f
+    for f in "$JOBS_DIR"/*.job; do echo "$f"; done
+    shopt -u nullglob
+}
+
+cancel_job_file() {
+    local f="$1"
+    (
+        # shellcheck disable=SC1090
+        source "$f"
+        kill "$JOB_PID" 2>/dev/null || true
+        echo "cancelled auto-resume [$(basename "$f" .job)] that was set for" \
+            "$(date -d "@$JOB_TARGET" '+%H:%M:%S') (dir: ${JOB_CWD:-?})"
+    )
+    rm -f "$f"
+}
 
 cmd_status() {
-    if [[ ! -f "$JOB_FILE" ]]; then
+    migrate_legacy_job
+    local jobs f mine
+    mapfile -t jobs < <(list_jobs)
+    if ((${#jobs[@]} == 0)); then
         echo "no auto-resume scheduled"
         return 0
     fi
-    # shellcheck disable=SC1090
-    source "$JOB_FILE"
-    if ! kill -0 "$JOB_PID" 2>/dev/null; then
-        echo "stale job (watcher no longer running) — clearing"
-        rm -f "$JOB_FILE"
-        return 0
-    fi
-    echo "auto-resume scheduled for $(date -d "@$JOB_TARGET" '+%F %H:%M:%S')" \
-        "($(((JOB_TARGET - $(date +%s)) / 60)) min from now)" \
-        "via $JOB_BACKEND, message: '$JOB_MESSAGE'"
+    mine=" $(current_job_keys | tr '\n' ' ') "
+    for f in "${jobs[@]}"; do
+        (
+            # shellcheck disable=SC1090
+            source "$f"
+            id="$(basename "$f" .job)"
+            marker=""
+            [[ "$mine" == *" $id "* ]] && marker=" (this terminal)"
+            if ! kill -0 "$JOB_PID" 2>/dev/null; then
+                echo "[$id] stale (watcher no longer running) — clearing"
+                rm -f "$f"
+            else
+                echo "[$id]$marker resumes at $(date -d "@$JOB_TARGET" '+%F %H:%M:%S')" \
+                    "($(((JOB_TARGET - $(date +%s)) / 60)) min from now)" \
+                    "via $JOB_BACKEND, dir: ${JOB_CWD:-?}, message: '$JOB_MESSAGE'"
+            fi
+        )
+    done
 }
 
 cmd_cancel() {
-    if [[ ! -f "$JOB_FILE" ]]; then
+    local arg="${1:-}" jobs f key
+    migrate_legacy_job
+    mapfile -t jobs < <(list_jobs)
+    if ((${#jobs[@]} == 0)); then
         echo "nothing to cancel"
         return 0
     fi
-    # shellcheck disable=SC1090
-    source "$JOB_FILE"
-    kill "$JOB_PID" 2>/dev/null || true
-    rm -f "$JOB_FILE"
-    echo "cancelled auto-resume that was set for $(date -d "@$JOB_TARGET" '+%H:%M:%S')"
+
+    if [[ "$arg" == "all" ]]; then
+        for f in "${jobs[@]}"; do cancel_job_file "$f"; done
+        return 0
+    fi
+    if [[ -n "$arg" ]]; then
+        f="$JOBS_DIR/$arg.job"
+        if [[ ! -f "$f" ]]; then
+            echo "no job with id '$arg' — see: claude-auto-resume status" >&2
+            return 1
+        fi
+        cancel_job_file "$f"
+        return 0
+    fi
+
+    # No argument: prefer this terminal's own job; if there is exactly one
+    # job anywhere, cancel that; otherwise make the user pick.
+    while IFS= read -r key; do
+        if [[ -n "$key" && -f "$JOBS_DIR/$key.job" ]]; then
+            cancel_job_file "$JOBS_DIR/$key.job"
+            return 0
+        fi
+    done < <(current_job_keys)
+    if ((${#jobs[@]} == 1)); then
+        cancel_job_file "${jobs[0]}"
+        return 0
+    fi
+    echo "multiple auto-resume jobs exist and none belongs to this terminal:"
+    cmd_status
+    echo "cancel one with: claude-auto-resume cancel <id>   (or: cancel all)"
+    return 1
 }
 
 cmd_schedule() {
-    local time_arg="$1" message="${2:-continue}" target_epoch
+    local time_arg="$1" message="${2:-continue}" target_epoch key job_file
 
     target_epoch=$(parse_target_epoch "$time_arg")
     detect_backend
-    mkdir -p "$STATE_DIR"
+    mkdir -p "$JOBS_DIR"
+    migrate_legacy_job
 
-    # replace any existing job
-    [[ -f "$JOB_FILE" ]] && cmd_cancel >/dev/null
+    key="$(job_key "$BACKEND" "$TARGET_ID" "$PWD")"
+    job_file="$JOBS_DIR/$key.job"
 
-    setsid bash "$0" --watch "$target_epoch" "$BACKEND" "$TARGET_ID" "$message" "$PWD" \
+    # replace an existing job for this same terminal+directory only —
+    # jobs belonging to other terminals/tabs/panes are left alone
+    [[ -f "$job_file" ]] && cancel_job_file "$job_file" >/dev/null
+
+    setsid bash "$0" --watch "$target_epoch" "$BACKEND" "$TARGET_ID" "$message" "$PWD" "$job_file" \
         </dev/null >>"$LOG_FILE" 2>&1 &
     local pid=$!
     disown "$pid" 2>/dev/null || true
 
-    cat >"$JOB_FILE" <<EOF
+    cat >"$job_file" <<EOF
 JOB_PID=$pid
 JOB_TARGET=$target_epoch
 JOB_BACKEND=$BACKEND
@@ -245,8 +348,8 @@ JOB_MESSAGE='$message'
 JOB_CWD='$PWD'
 EOF
 
-    log "scheduled: fire at $(date -d "@$target_epoch" '+%F %T') backend=$BACKEND target=$TARGET_ID pid=$pid"
-    echo "✔ auto-resume set for $(date -d "@$target_epoch" '+%H:%M:%S')" \
+    log "scheduled: job=$key fire at $(date -d "@$target_epoch" '+%F %T') backend=$BACKEND target=$TARGET_ID pid=$pid"
+    echo "✔ auto-resume [$key] set for $(date -d "@$target_epoch" '+%H:%M:%S')" \
         "($(((target_epoch - $(date +%s)) / 60)) min from now)."
     if [[ "$BACKEND" == "offline" ]]; then
         echo "  Offline mode: instruction '$message' saved — will run" \
@@ -265,6 +368,6 @@ case "${1:-}" in
 --watch) shift; watch_and_fire "$@" ;;
 --offline) shift; [[ $# -ge 1 ]] || usage; FORCE_OFFLINE=1 cmd_schedule "$@" ;;
 status) cmd_status ;;
-cancel) cmd_cancel ;;
+cancel) shift; cmd_cancel "$@" ;;
 *) cmd_schedule "$@" ;;
 esac
